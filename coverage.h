@@ -17,6 +17,7 @@ limitations under the License.
 #ifndef COVERAGE_H
 #define COVERAGE_H
 
+#include <inttypes.h>
 #include <string>
 #include <set>
 #include <list>
@@ -35,7 +36,7 @@ typedef std::list<ModuleCoverage> Coverage;
 ModuleCoverage *GetModuleCoverage(Coverage &coverage, std::string &name);
 
 void PrintCoverage(Coverage& coverage);
-void WriteCoverage(Coverage& coverage, char *filename);
+void WriteCoverage(Coverage& coverage, const char *filename);
 
 void MergeCoverage(Coverage &coverage, Coverage &toAdd);
 void CoverageIntersection(Coverage &coverage1,
@@ -57,3 +58,4 @@ void WriteCoverageBinary(Coverage& coverage, char *filename);
 void WriteCoverageBinary(Coverage& coverage, FILE *fp);
 
 #endif // COVERAGE_H
+

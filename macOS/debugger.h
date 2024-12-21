@@ -79,6 +79,17 @@ enum DebuggerStatus {
   DEBUGGER_ATTACHED,
 };
 
+enum CallingConvention {
+  CALLCONV_DEFAULT,
+};
+
+enum MemoryProtection {
+  READONLY,
+  READWRITE,
+  READEXECUTE,
+  READWRITEEXECUTE
+};
+
 class SharedMemory {
 public:
   SharedMemory(mach_vm_address_t la,
@@ -145,6 +156,9 @@ public:
   DebuggerStatus Kill();
   DebuggerStatus Continue(uint32_t timeout);
   DebuggerStatus Attach(unsigned int pid, uint32_t timeout);
+  DebuggerStatus GetDebuggerStatus() {
+    return dbg_last_status;
+  }
 
   bool IsTargetAlive();
   bool IsTargetFunctionDefined() { return target_function_defined; }
@@ -170,15 +184,8 @@ public:
   Exception GetLastException() {
     return last_exception;
   }
-
-protected:
-  enum MemoryProtection {
-    READONLY,
-    READWRITE,
-    READEXECUTE,
-    READWRITEEXECUTE
-  };
   
+protected:
   enum TargetEndDetection {
     RETADDR_STACK_OVERWRITE,
     RETADDR_BREAKPOINT
@@ -223,7 +230,7 @@ protected:
   bool attach_mode;
   bool loop_mode;
   bool disable_aslr;
-  bool private_dlyd_cache;
+  bool private_dyld_cache;
 
   std::list<std::string> additional_env;
   
@@ -250,7 +257,8 @@ protected:
                          size_t min_address,
                          size_t max_address,
                          std::list<AddressRange> *executable_ranges,
-                         size_t *code_size);
+                         size_t *code_size,
+                         bool do_protect = true);
 
   void ProtectCodeRanges(std::list<AddressRange> *executable_ranges);
 
@@ -271,7 +279,10 @@ protected:
   void SaveRegisters(SavedRegisters *registers);
   void RestoreRegisters(SavedRegisters *registers);
 
-  void *GetSymbolAddress(void *base_address, char *symbol_name);
+  void *GetSymbolAddress(void *base_address, const char *symbol_name);
+
+  void GetFunctionArguments(uint64_t *arguments, size_t num_arguments, uint64_t sp, CallingConvention callconv = CALLCONV_DEFAULT);
+  void SetFunctionArguments(uint64_t *arguments, size_t num_arguments, uint64_t sp, CallingConvention callconv = CALLCONV_DEFAULT);
 
 private:
   static std::unordered_map<task_t, Debugger*> task_to_debugger_map;
@@ -391,7 +402,9 @@ private:
   void ExtractSegmentCodeRanges(mach_vm_address_t segment_start_addr,
                                 mach_vm_address_t segment_end_addr,
                                 std::list<AddressRange> *executable_ranges,
-                                size_t *code_size);
+                                size_t *code_size, bool do_protect = true);
+
+  void HandleDyld(void *module);
 
   char target_module[PATH_MAX];
   char target_method[PATH_MAX];
@@ -423,6 +436,10 @@ private:
   void (*m_dyld_process_info_release)(void *info);
 
   void *m_dyld_debugger_notification;
+
+  void *dyld_address;
+  
+  bool mute_child;
 };
 
 

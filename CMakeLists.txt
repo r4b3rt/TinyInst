@@ -16,7 +16,12 @@ cmake_minimum_required(VERSION "3.1")
 set (CMAKE_CXX_STANDARD 17)
 
 # Determine whether TinyInst should be build for arm64 or x86
-if(APPLE AND NOT DEFINED ${ARCHITECTURE})
+if (WIN32)
+  # no support for arm64 on Windows
+elseif(${ANDROID_ABI} MATCHES "arm64")
+  set(ARCHITECTURE ${ANDROID_ABI})
+  add_definitions(-DARM64)
+elseif(NOT DEFINED ${ARCHITECTURE})
   EXECUTE_PROCESS(COMMAND uname -m COMMAND tr -d '\n' OUTPUT_VARIABLE ARCHITECTURE)
   if(${ARCHITECTURE} MATCHES arm64)
     add_definitions(-DARM64)
@@ -61,6 +66,8 @@ set (cross_platform_files
      litecov.h
      litecov.cpp
      unwind.h
+     hook.cpp
+     hook.h
 )
 
 if (WIN32)
@@ -102,6 +109,17 @@ elseif (APPLE)
        macOS/dyld_cache_map_parser.cpp
        macOS/dyld_cache_map_parser.h
   )
+elseif (UNIX)
+  set (platform_specific_files
+       Linux/debugger.h
+       Linux/debugger.cpp
+       Linux/elffile.h
+       Linux/elffile.cpp
+       Linux/procmaps.h
+       Linux/procmaps.cpp
+       Linux/syscallhook.h
+       Linux/syscallhook.cpp
+  )
 endif()
 
 add_library(tinyinst STATIC
@@ -116,7 +134,7 @@ target_include_directories(tinyinst PUBLIC
   ${CMAKE_CURRENT_BINARY_DIR}/third_party/obj/wkit/include
 )
 
-if((${ARCHITECTURE} MATCHES arm64) AND APPLE)
+if(${ARCHITECTURE} MATCHES arm64)
   add_dependencies(tinyinst reil)
   target_link_libraries(tinyinst reil)
 else()
@@ -126,12 +144,22 @@ else()
                           ${CMAKE_CURRENT_BINARY_DIR}/third_party/obj/wkit/lib/xed.lib
                           Dbghelp.lib
     )
-  elseif (APPLE)
+  else ()
     target_link_libraries(tinyinst
                           ${CMAKE_CURRENT_BINARY_DIR}/third_party/obj/wkit/lib/libxed.a
     )
   endif()
 endif()
+
+project("sslhook")
+
+add_executable(sslhook
+  sslhook-main.cpp
+  sslhook.h
+  sslhook.cpp
+)
+
+target_link_libraries(sslhook tinyinst)
 
 project("litecov")
 

@@ -26,6 +26,20 @@ limitations under the License.
 #include "windows.h"
 #include "arch/x86/reg.h"
 
+enum CallingConvention {
+  CALLCONV_MICROSOFT_X64,
+  CALLCONV_THISCALL,
+  CALLCONV_FASTCALL,
+  CALLCONV_CDECL,
+  CALLCONV_DEFAULT,
+};
+
+enum MemoryProtection {
+  READONLY,
+  READWRITE,
+  READEXECUTE,
+  READWRITEEXECUTE
+};
 
 enum DebuggerStatus {
   DEBUGGER_NONE,
@@ -79,13 +93,6 @@ public:
 
 protected:
 
-  enum MemoryProtection {
-    READONLY,
-    READWRITE,
-    READEXECUTE,
-    READWRITEEXECUTE
-  };
-
   virtual void OnModuleLoaded(void *module, char *module_name);
   virtual void OnModuleUnloaded(void *module);
   virtual void OnTargetMethodReached() {}
@@ -101,11 +108,12 @@ protected:
   virtual void OnCrashed(Exception *exception_record) { }
 
   void *GetModuleEntrypoint(void *base_address);
-  void ReadStack(void *stack_addr, void **buffer, size_t numitems);
-  void WriteStack(void *stack_addr, void **buffer, size_t numitems);
+  void ReadStack(void *stack_addr, uint64_t *buffer, size_t numitems);
+  void WriteStack(void *stack_addr, uint64_t *buffer, size_t numitems);
   void GetImageSize(void *base_address, size_t *min_address, size_t *max_address);
 
   // helper functions
+  void* RemoteAllocate(size_t size, MemoryProtection protection);
   void *RemoteAllocateNear(uint64_t region_min,
     uint64_t region_max,
     size_t size,
@@ -116,7 +124,8 @@ protected:
                          size_t min_address,
                          size_t max_address,
                          std::list<AddressRange> *executable_ranges,
-                         size_t *code_size);
+                         size_t *code_size,
+                         bool do_protect = true);
 
   void ProtectCodeRanges(std::list<AddressRange> *executable_ranges);
 
@@ -124,7 +133,7 @@ protected:
   virtual size_t GetTranslatedAddress(size_t address) { return address; }
 
   void RemoteFree(void *address, size_t size);
-  void RemoteWrite(void *address, void *buffer, size_t size);
+  void RemoteWrite(void *address, const void *buffer, size_t size);
   void RemoteRead(void *address, void *buffer, size_t size);
   void RemoteProtect(void *address, size_t size, MemoryProtection protect);
 
@@ -133,16 +142,25 @@ protected:
 
   void *GetTargetMethodAddress() { return target_address;  }
 
-  DWORD GetProcOffset(HMODULE module, const char* name); 
+  DWORD GetProcOffset(HMODULE module, const char* name);
+  void* GetSymbolAddress(void* base_address, const char* symbol_name);
 
   void SaveRegisters(SavedRegisters* registers);
   void RestoreRegisters(SavedRegisters* registers);
+
+  void SetReturnAddress(size_t value);
+  size_t GetReturnAddress();
+
+  void GetFunctionArguments(uint64_t* arguments, size_t num_args, uint64_t sp, CallingConvention callconv);
+  void SetFunctionArguments(uint64_t* arguments, size_t num_args, uint64_t sp, CallingConvention callconv);
 
   void GetExceptionHandlers(size_t module_haeder, std::unordered_set <size_t>& handlers);
 
   void PatchPointersRemote(size_t min_address, size_t max_address, std::unordered_map<size_t, size_t>& search_replace);
   template<typename T>
   void PatchPointersRemoteT(size_t min_address, size_t max_address, std::unordered_map<size_t, size_t>& search_replace);
+
+  HANDLE GetChildProcessHandle() { return child_handle; }
 
 private:
   struct Breakpoint {
@@ -210,11 +228,11 @@ private:
   uint64_t target_offset;
   std::string target_module;
   std::string target_method;
-  int calling_convention;
+  CallingConvention calling_convention;
   void *target_address;
   void *saved_sp;
   void *saved_return_address;
-  void **saved_args;
+  uint64_t *saved_args;
 
   uint64_t target_return_value;
 

@@ -27,12 +27,16 @@ limitations under the License.
   #include "Windows/debugger.h"
 #elif __APPLE__
   #include "macOS/debugger.h"
+#else
+  #include "Linux/debugger.h"
 #endif
 
 #include "common.h"
 #include "assembler.h"
 #include "instruction.h"
 #include "unwind.h"
+
+class Hook;
 
 #if defined(_WIN64)
 
@@ -144,21 +148,24 @@ protected:
   virtual InstructionResult InstrumentInstruction(ModuleInfo *module,
                                                   Instruction& inst,
                                                   size_t bb_address,
-                                                  size_t instruction_address)
-  {
-    return INST_NOTHANDLED;
-  }
+                                                  size_t instruction_address);
 
   virtual void OnModuleInstrumented(ModuleInfo* module);
   virtual void OnModuleUninstrumented(ModuleInfo* module);
+  virtual void OnBasicBlcokTranslated(ModuleInfo *module, size_t start_offset, size_t end_offset) { }
 
   int32_t sp_offset;
   Assembler* assembler_;
 
   UnwindGenerator* unwind_generator;
   virtual void OnReturnAddress(ModuleInfo *module, size_t original_address, size_t translated_address);
+  
+  void RegisterHook(Hook *hook);
+  
+  void InstrumentAddressRange(const char *name, size_t min_address, size_t max_address);
 
 private:
+  void AddInstrumentedModule(char* name, bool do_protect);
   bool HandleBreakpoint(void *address);
   void OnInstrumentModuleLoaded(void *module, ModuleInfo *target_module);
   ModuleInfo *IsInstrumentModule(char *module_name);
@@ -177,7 +184,10 @@ private:
                           uint32_t jmp_offset,
                           std::set<char *> *queue,
                           std::list<std::pair<uint32_t, uint32_t>> *offset_fixes);
-  void InvalidInstruction(ModuleInfo *module);
+  void InvalidInstruction(ModuleInfo* module);
+
+  // relative jump outside of current module
+  void OutsideJump(ModuleInfo* module, size_t address);
 
   // needed to support cross-module linking
   // on module unloads / reloads
@@ -247,11 +257,15 @@ private:
 
   PatchModuleEntriesValue patch_module_entries;
 
+  std::list<Hook *> hooks;
+  std::unordered_map<uint64_t, Hook *> resolved_hooks;
+  
   friend class Asssembler;
   friend class X86Assembler;
   friend class Arm64Assembler;
   friend class ModuleInfo;
   friend class UnwindGenerator;
+  friend class Hook;
 #if defined(_WIN64)
   friend class WinUnwindGenerator;
 #elif __APPLE__
@@ -302,11 +316,14 @@ class ModuleInfo {
   size_t jumptable_address_offset;
 
   std::unordered_set<size_t> invalid_instructions;
+  std::unordered_map<size_t, size_t> outside_jumps;
   std::unordered_map<size_t, size_t> tracepoints;
 
   std::unordered_set<size_t> entry_offsets;
 
   UnwindData *unwind_data;
+  
+  bool do_protect;
 
   // clients can use this to store additional data
   // about the module

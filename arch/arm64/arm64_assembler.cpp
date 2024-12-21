@@ -35,10 +35,13 @@ uint32_t NOP = 0xd503201f;
 uint32_t CRASH = 0xd63f03e0;
 
 uint32_t MRS_X0_NZCV = 0xd53b4200;
+uint32_t MRS_X1_NZCV = 0xd53b4201;
 uint32_t MSR_NZCV_X0 = 0xd51b4200;
 
 // strip pac tag
 uint32_t XPACI_X0 = 0xdac143e0;
+
+uint32_t RETURN = 0xd65f03c0;
 
 void PrintInstruction(uint64_t address, arm64::Instruction &instr) {
   std::cout << "0x" << std::hex << address << ": "
@@ -64,12 +67,18 @@ void Arm64Assembler::Crash(ModuleInfo *module) {
   tinyinst_.WriteCode(module, &CRASH, sizeof(CRASH));
 }
 
-void Arm64Assembler::Breakpoint(ModuleInfo *module) {
+size_t Arm64Assembler::Breakpoint(ModuleInfo *module) {
+  size_t ret = tinyinst_.GetCurrentInstrumentedAddress(module);
   tinyinst_.WriteCode(module, &BREAKPOINT, sizeof(BREAKPOINT));
+  return ret;
 }
 
 void Arm64Assembler::Nop(ModuleInfo *module) {
   tinyinst_.WriteCode(module, &NOP, sizeof(NOP));
+}
+
+void Arm64Assembler::Ret(ModuleInfo *module) {
+  tinyinst_.WriteCode(module, &RETURN, sizeof(RETURN));
 }
 
 static bool IsReturnInstruction(arm64::Opcode opcode) {
@@ -263,15 +272,12 @@ void Arm64Assembler::InstrumentGlobalIndirect(ModuleInfo *module,
          please use 'local'");
 }
 
-// converts an indirect jump/call into a MOV instruction
-// which moves the target of the indirect call into the X0 register
-// and writes this instruction into the code buffer
-//
+
 // returns the register number which is used by the original code
 // to perform the branch.
-uint8_t Arm64Assembler::MovIndirectTarget(ModuleInfo *module, Instruction &inst) {
+uint8_t Arm64Assembler::GetIndirectTarget(Instruction &inst, uint8_t *is_pac) {
   Register target_address_reg = Register::X0;
-  bool strip_pac = false;
+  uint8_t strip_pac = 0;
 
   switch (inst.instr.opcode) {
     case arm64::Opcode::kBraa:
@@ -283,7 +289,7 @@ uint8_t Arm64Assembler::MovIndirectTarget(ModuleInfo *module, Instruction &inst)
     case arm64::Opcode::kBlrab:
     case arm64::Opcode::kBlraaz:
     case arm64::Opcode::kBlrabz:
-      strip_pac = true;
+      strip_pac = 1;
       // fall through
     case arm64::Opcode::kBr:
     case arm64::Opcode::kBlr:
@@ -293,7 +299,7 @@ uint8_t Arm64Assembler::MovIndirectTarget(ModuleInfo *module, Instruction &inst)
 
     case arm64::Opcode::kRetaa:
     case arm64::Opcode::kRetab:
-      strip_pac = true;
+      strip_pac = 1;
         // fall through
     case arm64::Opcode::kRet:
       target_address_reg = Register::LR;
@@ -303,12 +309,19 @@ uint8_t Arm64Assembler::MovIndirectTarget(ModuleInfo *module, Instruction &inst)
       FATAL("not implemented yet");
   }
 
-  uint32_t mov_instr = mov(Register::X0, target_address_reg);
+  if(is_pac) *is_pac = strip_pac;
+  return static_cast<uint8_t>(target_address_reg);
+}
+
+// converts an indirect jump/call into a MOV instruction
+// which moves the target of the indirect call into the X0 register
+// and writes this instruction into the code buffer
+void Arm64Assembler::MovIndirectTarget(ModuleInfo *module, uint8_t target_address_reg, uint8_t is_pac) {
+  uint32_t mov_instr = mov(Register::X0, static_cast<Register>(target_address_reg));
   tinyinst_.WriteCode(module, &mov_instr, sizeof(mov_instr));
-  if (strip_pac) {
+  if (is_pac) {
     tinyinst_.WriteCode(module, &XPACI_X0, sizeof(XPACI_X0));
   }
-  return static_cast<uint8_t>(target_address_reg);
 }
 
 // translates indirect jump or call
@@ -326,17 +339,25 @@ void Arm64Assembler::InstrumentLocalIndirect(ModuleInfo *module,
   // it in the if clause.
   OffsetStack(module, -32);
 
+  uint8_t is_pac = 0;
+  uint8_t branch_register_number = GetIndirectTarget(inst, &is_pac);
+
   // stack layout
   // x0
   // x1
   // alu flags
   WriteRegStack(module, Register::X1, 16);
   WriteRegStack(module, Register::X0, 8);
-  tinyinst_.WriteCode(module, &MRS_X0_NZCV, sizeof(MRS_X0_NZCV));
-  WriteRegStack(module, Register::X0, 0);
+  if(branch_register_number != 0) {
+    tinyinst_.WriteCode(module, &MRS_X0_NZCV, sizeof(MRS_X0_NZCV));
+    WriteRegStack(module, Register::X0, 0);
+  } else {
+    tinyinst_.WriteCode(module, &MRS_X1_NZCV, sizeof(MRS_X1_NZCV));
+    WriteRegStack(module, Register::X1, 0);
+  }
 
   // Emit instructions that load the target address to the X0 register.
-  uint8_t branch_register_number = MovIndirectTarget(module, inst);
+  MovIndirectTarget(module, branch_register_number, is_pac);
 
   // InstrumentLocalIndirect iterates through a linked list until the it
   // finds the code that was generated for the target address. Jumps are
@@ -409,9 +430,16 @@ void Arm64Assembler::TranslateJmp(ModuleInfo *module, ModuleInfo *target_module,
   tinyinst_.InstrumentEdge(module, target_module, breakpoint_info.source_bb,
                            original_target);
 
+  size_t ldr_offset2 = module->instrumented_code_allocated;
+  ldr_lit_instr =
+      ldr_lit(static_cast<Register>(reg_num), 0, 64, /*is_signed*/ false);
+  tinyinst_.WriteCode(module, &ldr_lit_instr, sizeof(ldr_lit_instr));
+  
   uint32_t br_instr = br(static_cast<Register>(reg_num));
   tinyinst_.WriteCode(module, &br_instr, sizeof(br_instr));
+  
   FixOffset(module, ldr_offset, module->instrumented_code_allocated);
+  FixOffset(module, ldr_offset2, module->instrumented_code_allocated + 8);
 }
 
 static int32_t GetRipRelativeOffset(Instruction &inst) {
@@ -441,6 +469,7 @@ static int32_t GetRipRelativeOffset(Instruction &inst) {
 
     case arm64::Opcode::kLdrLiteral:
     case arm64::Opcode::kLdrsLiteral:
+    case arm64::Opcode::kSimdLdrLiteral:
       off64 =
           std::get<arm64::ImmediateOffset>(inst.instr.operands[1]).offset.value;
       break;
@@ -469,6 +498,7 @@ bool Arm64Assembler::IsRipRelative(ModuleInfo *module, Instruction &inst,
   switch (inst.instr.opcode) {
     case arm64::kLdrLiteral:
     case arm64::kLdrsLiteral:
+    case arm64::kSimdLdrLiteral:
     case arm64::kAdr:
       pc_relative = true;
       offset = GetRipRelativeOffset(inst);
@@ -551,6 +581,11 @@ void Arm64Assembler::FixInstructionAndOutput(
       break;
     }
 
+    case arm64::Opcode::kSimdLdrLiteral: {
+      TranslateSimdLdrLiteral(module, inst, input, input_address_remote);
+      break;
+    }
+
     case arm64::Opcode::kLdrsLiteral: {
       FATAL("arm64::kLdrsLiteral");
       break;
@@ -566,6 +601,29 @@ void Arm64Assembler::FixInstructionAndOutput(
       FATAL("not implemented yet");
       break;
   }
+}
+
+void Arm64Assembler::TranslateSimdLdrLiteral(ModuleInfo *module,
+                             Instruction &inst,
+                             const unsigned char *input,
+                             const unsigned char *input_address_remote)
+{
+  // push X0
+  OffsetStack(module, -tinyinst_.sp_offset - 16);
+  WriteRegStack(module, Register::X0, 0);
+
+  //load address into X0;
+  uint64_t addr = (uint64_t)input_address_remote;
+  addr += GetRipRelativeOffset(inst);
+  EmitLoadLit(module, X0, 64, false, addr);
+
+  uint32_t orig_instr = *(uint32_t *)input;
+  uint32_t fixed_instr = ldr_simd_x0_from_ldr_simd_literal(orig_instr);
+  tinyinst_.WriteCode(module, &fixed_instr, sizeof(fixed_instr));
+
+  // pop X0
+  ReadRegStack(module, Register::X0, 0);
+  OffsetStack(module, tinyinst_.sp_offset + 16);
 }
 
 void Arm64Assembler::InstrumentRet(
@@ -629,13 +687,6 @@ void Arm64Assembler::InstrumentCondJmp(
   const char *target_address1 = address + offset;
   const char *target_address2 = address + last_offset + branch_offset;
 
-  if (tinyinst_.GetModule((size_t)target_address2) != module) {
-    WARN("Relative jump to a differen module in bb at %p\n",
-         static_cast<const void *>(address));
-    tinyinst_.InvalidInstruction(module);
-    return;
-  }
-
   // preliminary encode cond branch instruction
   // offset will be changed later as we don't know
   // the size of edge instrumentation yet
@@ -662,6 +713,11 @@ void Arm64Assembler::InstrumentCondJmp(
   // fix conditional branch
   FixOffset(module, cond_branch_offset, label_offset);
 
+  if (tinyinst_.GetModule((size_t)target_address2) != module) {
+    tinyinst_.OutsideJump(module, (size_t)target_address2);
+    return;
+  }
+  
   // instrument the 2nd edge
   tinyinst_.InstrumentEdge(module, module, (size_t)address,
                            (size_t)target_address2);
@@ -691,8 +747,7 @@ void Arm64Assembler::InstrumentJmp(
     const char *target_address = address + last_offset + branch_offset;
 
     if (tinyinst_.GetModule((size_t)target_address) != module) {
-      WARN("Relative jump to a differen module in bb at %p\n", (void *)address);
-      tinyinst_.InvalidInstruction(module);
+      tinyinst_.OutsideJump(module, (size_t)target_address);
       return;
     }
 
@@ -741,13 +796,6 @@ void Arm64Assembler::InstrumentCall(
     const char *return_address = address + offset;
     const char *call_address = address + last_offset + branch_offset;
 
-    if (tinyinst_.GetModule((size_t)call_address) != module) {
-      WARN("Relative jump to a differen module in bb at %p\n",
-           static_cast<const void *>(address));
-      tinyinst_.InvalidInstruction(module);
-      return;
-    }
-
     if (!tinyinst_.patch_return_addresses) {
       uint64_t addr = (uint64_t)module->instrumented_code_allocated +
                       (uint64_t)module->instrumented_code_local;
@@ -769,6 +817,11 @@ void Arm64Assembler::InstrumentCall(
           (uint32_t)(module->instrumented_code_allocated - 4), queue,
           offset_fixes);
 
+      if (tinyinst_.GetModule((size_t)call_address) != module) {
+        tinyinst_.OutsideJump(module, (size_t)call_address);
+        return;
+      }
+      
       // jmp call_address
       tinyinst_.WriteCode(module, &branch_instr, sizeof(branch_instr));
 
@@ -780,6 +833,11 @@ void Arm64Assembler::InstrumentCall(
     } else {
       SetReturnAddress(module, (uint64_t)return_address);
 
+      if (tinyinst_.GetModule((size_t)call_address) != module) {
+        tinyinst_.OutsideJump(module, (size_t)call_address);
+        return;
+      }
+      
       uint32_t branch_instr = b(0, 0);
       // jmp call_address
       tinyinst_.WriteCode(module, &branch_instr, sizeof(branch_instr));
@@ -863,7 +921,7 @@ void Arm64Assembler::HandleBasicBlockEnd(
     const char *address, ModuleInfo *module, std::set<char *> *queue,
     std::list<std::pair<uint32_t, uint32_t>> *offset_fixes, Instruction &inst,
     const char *code_ptr, size_t offset, size_t last_offset) {
-
+  
   if (IsReturnInstruction(inst.instr.opcode)) {
     InstrumentRet(address, module, queue, offset_fixes, inst, code_ptr, offset,
                   last_offset);

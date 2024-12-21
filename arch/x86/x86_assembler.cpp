@@ -22,6 +22,9 @@ unsigned char BREAKPOINT[] = {0xCC};
 // nop
 unsigned char NOP[] = {0x90};
 
+// ret
+unsigned char RETURN[] = {0xC3};
+
 // jmp offset
 unsigned char JMP[] = {0xe9, 0x00, 0x00, 0x00, 0x00};
 
@@ -130,12 +133,18 @@ void X86Assembler::Crash(ModuleInfo *module) {
   }
 }
 
-void X86Assembler::Breakpoint(ModuleInfo *module) {
+size_t X86Assembler::Breakpoint(ModuleInfo *module) {
+  size_t ret = tinyinst_.GetCurrentInstrumentedAddress(module);
   tinyinst_.WriteCode(module, &BREAKPOINT, sizeof(BREAKPOINT));
+  return ret;
 }
 
 void X86Assembler::Nop(ModuleInfo *module) {
   tinyinst_.WriteCode(module, &NOP, sizeof(NOP));
+}
+
+void X86Assembler::Ret(ModuleInfo *module) {
+  tinyinst_.WriteCode(module, &RETURN, sizeof(RETURN));
 }
 
 void X86Assembler::JmpAddress(ModuleInfo *module, size_t address) {
@@ -174,6 +183,11 @@ bool X86Assembler::IsRipRelative(ModuleInfo *module,
   }
 
   if (!rip_relative) return false;
+
+  // some wide NOPS migth appear as having a RIP relative offset
+  // treat them as normal instructions
+  xed_category_enum_t category = xed_decoded_inst_get_category(&inst.xedd);
+  if(category == XED_CATEGORY_WIDENOP) return false;
 
   size_t instruction_size = xed_decoded_inst_get_length(&inst.xedd);
   *mem_address = (size_t)(instruction_address + instruction_size + disp);
@@ -605,7 +619,11 @@ void X86Assembler::FixInstructionAndOutput(
   // as it needs not be the original size
   fixed_disp = (int64_t)(mem_address) - (int64_t)(instruction_end_addr);
 
-  if (llabs(fixed_disp) > 0x7FFFFFFF) FATAL("Offset larger than 2G");
+  if (llabs(fixed_disp) > 0x7FFFFFFF) {
+    WARN("Offset larger than 2G");
+    tinyinst_.InvalidInstruction(module);
+    return;
+  }
 
   xed_encoder_request_set_memory_displacement(&inst.xedd, fixed_disp, 4);
   xed_error = xed_encode(&inst.xedd, tmp, sizeof(tmp), &olen);
@@ -676,6 +694,16 @@ bool X86Assembler::DecodeInstruction(Instruction &inst,
       break;
   }
 
+  if((iclass == XED_ICLASS_XABORT) || (iclass == XED_ICLASS_XEND)) { inst.bbend = false; }
+  else if(iclass == XED_ICLASS_XBEGIN) {
+    const xed_inst_t *xi = xed_decoded_inst_inst(&inst.xedd);
+    const xed_operand_t *op = xed_inst_operand(xi, 0);
+    xed_operand_enum_t operand_name = xed_operand_name(op);
+    if (operand_name != XED_OPERAND_RELBR) {
+      inst.bbend = false;
+    }
+  }
+
   if (category == XED_CATEGORY_RET && iclass == XED_ICLASS_RET_NEAR) {
     inst.iclass = InstructionClass::RET;
   }
@@ -712,6 +740,7 @@ void X86Assembler::HandleBasicBlockEnd(
     const char *code_ptr,
     size_t offset,
     size_t last_offset) {
+
   xed_error_enum_t xed_error;
   xed_category_enum_t category = xed_decoded_inst_get_category(&inst.xedd);
   if (category == XED_CATEGORY_RET) {
@@ -759,12 +788,6 @@ void X86Assembler::HandleBasicBlockEnd(
 
     const char *target_address1 = address + offset;
     const char *target_address2 = address + offset + disp;
-
-    if (tinyinst_.GetModule((size_t)target_address2) != module) {
-      WARN("Relative jump to a differen module in bb at %p\n", address);
-      tinyinst_.InvalidInstruction(module);
-      return;
-    }
 
     // preliminary encode jump instruction
     // displacement might be changed later as we don't know
@@ -818,6 +841,11 @@ void X86Assembler::HandleBasicBlockEnd(
                                   jump_size);
     }
 
+    if (tinyinst_.GetModule((size_t)target_address2) != module) {
+      tinyinst_.OutsideJump(module, (size_t)target_address2);
+      return;
+    }
+
     // instrument the 2nd edge
     tinyinst_.InstrumentEdge(module, module, (size_t)address,
                              (size_t)target_address2);
@@ -854,8 +882,7 @@ void X86Assembler::HandleBasicBlockEnd(
       const char *target_address = address + offset + disp;
 
       if (tinyinst_.GetModule((size_t)target_address) != module) {
-        WARN("Relative jump to a differen module in bb at %p\n", address);
-        tinyinst_.InvalidInstruction(module);
+        tinyinst_.OutsideJump(module, (size_t)target_address);
         return;
       }
 
@@ -912,12 +939,6 @@ void X86Assembler::HandleBasicBlockEnd(
       const char *return_address = address + offset;
       const char *call_address = address + offset + disp;
 
-      if (tinyinst_.GetModule((size_t)call_address) != module) {
-        WARN("Relative jump to a differen module in bb at %p\n", address);
-        tinyinst_.InvalidInstruction(module);
-        return;
-      }
-
       // fix the displacement and emit the call
       if (!tinyinst_.patch_return_addresses) {
         unsigned char encoded[15];
@@ -944,6 +965,11 @@ void X86Assembler::HandleBasicBlockEnd(
             (uint32_t)(module->instrumented_code_allocated - 4), queue,
             offset_fixes);
 
+        if (tinyinst_.GetModule((size_t)call_address) != module) {
+          tinyinst_.OutsideJump(module, (size_t)call_address);
+          return;
+        }
+
         // jmp call_address
         tinyinst_.WriteCode(module, JMP, sizeof(JMP));
 
@@ -955,6 +981,11 @@ void X86Assembler::HandleBasicBlockEnd(
 
       } else {
         PushReturnAddress(module, (uint64_t)return_address);
+
+        if (tinyinst_.GetModule((size_t)call_address) != module) {
+          tinyinst_.OutsideJump(module, (size_t)call_address);
+          return;
+        }
 
         // jmp call_address
         tinyinst_.WriteCode(module, JMP, sizeof(JMP));

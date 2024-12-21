@@ -24,6 +24,7 @@ limitations under the License.
 #include <list>
 
 #include "tinyinst.h"
+#include "hook.h"
 
 #ifdef ARM64
   #include "arch/arm64/arm64_assembler.h"
@@ -47,6 +48,8 @@ ModuleInfo::ModuleInfo() {
   instrumented_code_remote_previous = NULL;
   instrumented_code_size = 0;
   unwind_data = NULL;
+  client_data = NULL;
+  do_protect = true;
 }
 
 void ModuleInfo::ClearInstrumentation() {
@@ -77,6 +80,8 @@ void ModuleInfo::ClearInstrumentation() {
   jumptable_address_offset = 0;
 
   invalid_instructions.clear();
+  outside_jumps.clear();
+
   tracepoints.clear();
 }
 
@@ -282,6 +287,7 @@ bool TinyInst::HandleBreakpoint(void *address) {
 
       printf("TRACE: Executing basic block, original at %p, instrumented at %p\n",
              (void *)iter->second, (void *)iter->first);
+
       return true;
     } else {
       printf("TRACE: Breakpoint\n");
@@ -299,8 +305,21 @@ bool TinyInst::HandleBreakpoint(void *address) {
     return true;
   }
 
+  auto iter = module->outside_jumps.find((size_t)address);
+  if (iter != module->outside_jumps.end()) {
+
+    // WARN("Executing relative jump outside the current module");
+    SetRegister(ARCH_PC, iter->second);
+
+    return true;
+  }
+
   if(unwind_generator->HandleBreakpoint(module, address)) {
     return true;
+  }
+  
+  for(auto iter = hooks.begin(); iter != hooks.end(); iter++) {
+    if((*iter)->HandleBreakpoint(module, address)) return true;
   }
 
   return false;
@@ -476,6 +495,13 @@ void TinyInst::InvalidInstruction(ModuleInfo *module) {
   assembler_->Crash(module);
 }
 
+void TinyInst::OutsideJump(ModuleInfo* module, size_t address) {
+  size_t breakpoint_address = (size_t)module->instrumented_code_remote +
+    module->instrumented_code_allocated;
+  assembler_->Breakpoint(module);
+  module->outside_jumps[breakpoint_address] = address;
+}
+
 void TinyInst::InstrumentIndirect(ModuleInfo *module,
                                   Instruction& inst,
                                   size_t instruction_address,
@@ -597,6 +623,8 @@ void TinyInst::TranslateBasicBlock(char *address,
   unwind_generator->OnBasicBlockEnd(module,
     (size_t)address + offset,
     GetCurrentInstrumentedAddress(module));
+
+  OnBasicBlcokTranslated(module, original_offset, original_offset + last_offset);
 }
 
 // starting from address, starts instrumenting code in the module
@@ -783,7 +811,9 @@ bool TinyInst::TryExecuteInstrumented(char *address) {
   if (!GetRegion(module, (size_t)address)) return false;
 
   if (trace_module_entries) {
-    printf("TRACE: Entered module %s at address %p\n", module->module_name.c_str(), static_cast<void*>(address));
+    printf("TRACE: Entered module %s at address %p, offset %zx\n",
+           module->module_name.c_str(), static_cast<void*>(address),
+           (size_t)address - (size_t)module->module_header );
   }
   if (patch_module_entries) {
     size_t entry_offset = (size_t)address - module->min_address;
@@ -806,6 +836,25 @@ void TinyInst::OnReturnAddress(ModuleInfo *module, size_t original_address, size
 
 void TinyInst::OnModuleInstrumented(ModuleInfo* module) {
   unwind_generator->OnModuleInstrumented(module);
+  
+  for (auto iter = hooks.begin(); iter != hooks.end(); iter++) {
+    Hook *hook = *iter;
+    if((hook->GetModuleName() == std::string("*")) || (hook->GetModuleName() == module->module_name)) {
+      size_t address = 0;
+      if(!hook->GetFunctionName().empty()) {
+        address = (size_t)GetSymbolAddress(module->module_header, hook->GetFunctionName().c_str());
+      } else if(hook->GetFunctionOffset()) {
+        address = (size_t)(module->module_header) + hook->GetFunctionOffset();
+      } else {
+        FATAL("Hook specifies neither function name nor offset");
+      }
+      if(address) {
+        resolved_hooks[address] = hook;
+      } else if (hook->GetModuleName() != std::string("*")) {
+        WARN("Could not resolve function %s in module %s", hook->GetFunctionName().c_str(), hook->GetModuleName().c_str());
+      }
+    }
+  }
 }
 
 void TinyInst::OnModuleUninstrumented(ModuleInfo* module) {
@@ -825,25 +874,48 @@ void TinyInst::ClearInstrumentation(ModuleInfo *module) {
   ClearCrossModuleLinks(module);
 }
 
+void TinyInst::InstrumentAddressRange(const char *name,
+                                      size_t min_address,
+                                      size_t max_address)
+{
+  ModuleInfo *module = GetModuleByName(name);
+  if(!module) {
+    module = new ModuleInfo();
+    module->module_name = name;
+    module->module_header = NULL;
+    instrumented_modules.push_back(module);
+  }
+  
+  module->loaded = true;
+  module->min_address = min_address;
+  module->max_address = max_address;
+
+  InstrumentModule(module);
+}
+
+
 void TinyInst::InstrumentModule(ModuleInfo *module) {
   if (instrumentation_disabled) return;
 
   // if the module was previously instrumented
   // just reuse the same data
   if (persist_instrumentation_data && module->instrumented) {
-    ProtectCodeRanges(&module->executable_ranges);
-    FixCrossModuleLinks(module);
     printf("Module %s already instrumented, "
            "reusing instrumentation data\n",
            module->module_name.c_str());
+    if (module->do_protect) {
+      ProtectCodeRanges(&module->executable_ranges);
+    }
+    FixCrossModuleLinks(module);
     return;
   }
-
+  
   ExtractCodeRanges(module->module_header,
                     module->min_address,
                     module->max_address,
                     &module->executable_ranges,
-                    &module->code_size);
+                    &module->code_size,
+                    module->do_protect);
 
   // allocate buffer for instrumented code
   module->instrumented_code_size = module->code_size * CODE_SIZE_MULTIPLIER;
@@ -1005,9 +1077,8 @@ void TinyInst::OnInstrumentModuleLoaded(void *module, ModuleInfo *target_module)
       target_module->module_header &&
       (target_module->module_header != (void *)module))
   {
-    WARN("Instrumented module loaded on a different address than seen previously\n"
-         "Module will need to be re-instrumented. Expect a drop in performance.");
-    ClearInstrumentation(target_module);
+    WARN("Skipping re-instrumentation of duplicate module %s.", target_module->module_name.c_str());
+    return;
   }
 
   target_module->module_header = (void *)module;
@@ -1025,7 +1096,7 @@ void TinyInst::OnInstrumentModuleLoaded(void *module, ModuleInfo *target_module)
   }
 }
 
-// called when a potentialy interesting module gets loaded
+// called when a potentially interesting module gets loaded
 void TinyInst::OnModuleLoaded(void *module, char *module_name) {
   Debugger::OnModuleLoaded(module, module_name);
 
@@ -1075,6 +1146,7 @@ bool TinyInst::OnException(Exception *exception_record) {
     if (HandleBreakpoint(exception_record->ip)) {
       return true;
     }
+    break;
   case ACCESS_VIOLATION:
     if (exception_record->maybe_execute_violation) {
       // possibly we are trying to executed code in an instrumented module
@@ -1082,6 +1154,7 @@ bool TinyInst::OnException(Exception *exception_record) {
         return true;
       }
     }
+    break;
   default:
     break;
   }
@@ -1113,6 +1186,49 @@ void TinyInst::OnProcessExit() {
   }
   // clear cross-module links
   ClearCrossModuleLinks();
+  
+  resolved_hooks.clear();
+  for (auto iter = hooks.begin(); iter != hooks.end(); iter++) {
+    (*iter)->OnProcessExit();
+  }
+}
+
+void TinyInst::RegisterHook(Hook *hook) {
+  hooks.push_back(hook);
+}
+
+InstructionResult TinyInst::InstrumentInstruction(ModuleInfo *module,
+                                        Instruction& inst,
+                                        size_t bb_address,
+                                        size_t instruction_address)
+{
+  if(!resolved_hooks.empty()) {
+    auto iter = resolved_hooks.find(instruction_address);
+    if(iter != resolved_hooks.end()) {
+      Hook *hook = iter->second;
+      printf("Hooking function %s in module %s\n",
+             hook->GetFunctionName().c_str(),
+             module->module_name.c_str());
+      hook->SetTinyInst(this);
+      hook->SetAssembler(assembler_);
+      return hook->InstrumentFunction(module, instruction_address);
+    }
+  }
+  
+  return INST_NOTHANDLED;
+}
+
+void TinyInst::AddInstrumentedModule(char* name, bool do_protect) {
+  std::string module_name = name;
+  for(auto iter=instrumented_modules.begin(); iter!=instrumented_modules.end(); iter++) {
+    if((*iter)->module_name == module_name) {
+      FATAL("Duplicate instrumented modules, module %s is already being instrumented", name);
+    }
+  }
+  ModuleInfo *new_module = new ModuleInfo();
+  new_module->module_name = module_name;
+  new_module->do_protect = do_protect;
+  instrumented_modules.push_back(new_module);
 }
 
 // initializes instrumentation from command line options
@@ -1199,9 +1315,15 @@ void TinyInst::Init(int argc, char **argv) {
 #endif
 
   for (const auto module_name: module_names) {
-    ModuleInfo *new_module = new ModuleInfo();
-    new_module->module_name = module_name;
-    instrumented_modules.push_back(new_module);
+    AddInstrumentedModule(module_name, true);
+    // SAY("--- %s\n", module_name);
+  }
+  
+  std::list <char *> module_names_transitive;
+  GetOptionAll("-instrument_transitive", argc, argv, &module_names_transitive);
+
+  for (const auto module_name: module_names_transitive) {
+    AddInstrumentedModule(module_name, false);
     // SAY("--- %s\n", module_name);
   }
 
